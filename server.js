@@ -5,7 +5,9 @@
    - Variables d'environnement :
        DATABASE_URL (ou POSTGRESQL_ADDON_URI) : adresse de la base PostgreSQL
        JWT_SECRET      : texte secret long et aléatoire (32 caractères minimum)
-       SETUP_CODE      : code à usage unique pour créer le compte la première fois
+       SETUP_CODE      : code secret pour créer le compte administrateur la première fois
+                         (il sert aussi à récupérer l'accès administrateur : garde-le secret)
+       MAX_USERS       : nombre maximum de praticiens (20 par défaut)
        ALLOWED_ORIGIN  : adresse de l'application, ex. https://mon-site.netlify.app
                          (plusieurs adresses possibles, séparées par des virgules)
        PORT            : fourni par l'hébergeur
@@ -18,7 +20,8 @@ const COLLECTIONS = new Set(["patients", "agenda", "plages", "closures", "exerci
 const ID_RE = /^[\w-]{1,80}$/;
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/;
 const MAX_BODY = 12 * 1024 * 1024, MAX_DOC = 4 * 1024 * 1024, MAX_BATCH = 100;
-const TOKEN_MS = 30 * 24 * 3600 * 1000;
+const TOKEN_MS = 30 * 24 * 3600 * 1000, INVITE_MS = 7 * 24 * 3600 * 1000;
+const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";   // sans I, L, O, 0, 1 (confusions)
 
 function b64u(s){ return Buffer.from(s).toString("base64url"); }
 function sign(payload, secret){
@@ -46,13 +49,20 @@ function checkPassword(pw, stored){
   const exp = Buffer.from(p[2], "base64"), h = crypto.scryptSync(pw, Buffer.from(p[1], "base64"), 64);
   return h.length === exp.length && crypto.timingSafeEqual(h, exp);
 }
+function newCode(){
+  let c = "";
+  for(let i = 0; i < 12; i++){ c += CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)]; if(i % 4 === 3 && i < 11) c += "-"; }
+  return c;
+}
+function normCode(c){ return String(c || "").toUpperCase().replace(/[^A-Z0-9]/g, ""); }
 function safeEq(a, b){
   const x = Buffer.from(String(a)), y = Buffer.from(String(b));
   return x.length === y.length && crypto.timingSafeEqual(x, y);
 }
 
 async function initDb(pool){
-  await pool.query("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, pass TEXT NOT NULL, created_at TEXT NOT NULL)");
+  await pool.query("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, pass TEXT NOT NULL, created_at TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'praticien', active BOOLEAN NOT NULL DEFAULT true, token_ver INTEGER NOT NULL DEFAULT 0, last_login TEXT, last_seen TEXT)");
+  await pool.query("CREATE TABLE IF NOT EXISTS invites (id SERIAL PRIMARY KEY, code_hash TEXT UNIQUE NOT NULL, email TEXT NOT NULL, kind TEXT NOT NULL, user_id INTEGER, expires_at TEXT NOT NULL, used BOOLEAN NOT NULL DEFAULT false, created_by INTEGER, created_at TEXT NOT NULL)");
   await pool.query("CREATE TABLE IF NOT EXISTS docs (user_id INTEGER NOT NULL, c TEXT NOT NULL, id TEXT NOT NULL, data JSONB, updated_at TEXT NOT NULL, deleted BOOLEAN NOT NULL DEFAULT false, rev BIGINT NOT NULL, PRIMARY KEY (user_id, c, id))");
   await pool.query("CREATE INDEX IF NOT EXISTS docs_rev_idx ON docs (user_id, rev)");
   await pool.query("CREATE TABLE IF NOT EXISTS rev_counter (id INTEGER PRIMARY KEY, v BIGINT NOT NULL)");
@@ -96,12 +106,31 @@ function createApp(pool, cfg){
       req.on("error", function(){ reject({ code: 400, error: "requete", message: "Requête interrompue." }); });
     });
   }
-  function auth(req){
+  async function authUser(req){
     const h = String(req.headers.authorization || "");
     const p = h.startsWith("Bearer ") ? verify(h.slice(7), cfg.secret) : null;
-    return p ? p.u : null;
+    if(!p) return null;
+    const r = await pool.query("SELECT id, email, role, active, token_ver, last_seen FROM users WHERE id = $1", [p.u]);
+    const u = r.rows[0];
+    if(!u || !u.active || Number(u.token_ver) !== Number(p.v)) return null;
+    const nowIso = new Date().toISOString();
+    if(!u.last_seen || Date.parse(nowIso) - Date.parse(u.last_seen) > 10 * 60 * 1000) await pool.query("UPDATE users SET last_seen = $1 WHERE id = $2", [nowIso, u.id]);
+    return { id: u.id, email: u.email, role: u.role };
   }
-  function newToken(userId){ return sign({ u: userId, exp: Date.now() + TOKEN_MS }, cfg.secret); }
+  function newToken(u){ return sign({ u: u.id, v: Number(u.token_ver || 0), exp: Date.now() + TOKEN_MS }, cfg.secret); }
+  function codeHash(code){ return crypto.createHmac("sha256", cfg.secret).update(normCode(code)).digest("hex"); }
+  async function createInvite(email, kind, userId, createdBy){
+    const code = newCode(), exp = new Date(Date.now() + INVITE_MS).toISOString();
+    await pool.query("DELETE FROM invites WHERE used = false AND email = $1 AND kind = $2", [email, kind]);
+    await pool.query("INSERT INTO invites (code_hash, email, kind, user_id, expires_at, used, created_by, created_at) VALUES ($1, $2, $3, $4, $5, false, $6, $7)", [codeHash(code), email, kind, userId || null, exp, createdBy || null, new Date().toISOString()]);
+    return { code: code, expiresAt: exp };
+  }
+  async function takeInvite(code, email, kind){
+    const r = await pool.query("SELECT id, email, user_id, expires_at, used FROM invites WHERE code_hash = $1 AND kind = $2", [codeHash(code), kind]);
+    const inv = r.rows[0];
+    if(!inv || inv.used || inv.expires_at < new Date().toISOString() || inv.email !== email) return null;
+    return inv;
+  }
   function checkLock(key){
     const f = fails.get(key);
     return !!(f && f.until && f.until > Date.now());
@@ -142,38 +171,138 @@ function createApp(pool, cfg){
       const b = await readBody(req), key = "setup|" + ip;
       if(checkLock(key)){ fail(req, res, 429, "trop_d_essais", "Trop d'essais : réessaie dans 15 minutes."); return; }
       const n = Number((await pool.query("SELECT COUNT(*) AS n FROM users")).rows[0].n);
-      if(n > 0){ fail(req, res, 409, "deja_configure", "Le compte existe déjà : connecte-toi."); return; }
+      if(n > 0){ fail(req, res, 409, "deja_configure", "Le serveur est déjà installé : connecte-toi, ou utilise un code d'invitation."); return; }
       if(!cfg.setupCode || !safeEq(b.setupCode || "", cfg.setupCode)){ addFail(key); await audit("setup", b.email, ip, false); fail(req, res, 403, "code_invalide", "Code d'installation incorrect."); return; }
       if(!EMAIL_RE.test(String(b.email || ""))){ fail(req, res, 400, "email_invalide", "Adresse e-mail invalide."); return; }
       if(typeof b.password !== "string" || b.password.length < 12){ fail(req, res, 400, "mot_de_passe_faible", "Le mot de passe doit contenir au moins 12 caractères."); return; }
       const email = String(b.email).trim().toLowerCase();
-      const r = await pool.query("INSERT INTO users (email, pass, created_at) VALUES ($1, $2, $3) RETURNING id", [email, hashPassword(b.password), new Date().toISOString()]);
+      const r = await pool.query("INSERT INTO users (email, pass, created_at, role, active, token_ver, last_login) VALUES ($1, $2, $3, 'admin', true, 0, $3) RETURNING id", [email, hashPassword(b.password), new Date().toISOString()]);
       await audit("setup", email, ip, true);
-      send(req, res, 200, { token: newToken(r.rows[0].id), email: email }); return;
+      send(req, res, 200, { token: newToken({ id: r.rows[0].id, token_ver: 0 }), email: email, role: "admin" }); return;
     }
     if(path === "/api/login" && req.method === "POST"){
       const b = await readBody(req), email = String(b.email || "").trim().toLowerCase(), key = "login|" + ip + "|" + email;
       if(checkLock(key)){ fail(req, res, 429, "trop_d_essais", "Trop d'essais : réessaie dans 15 minutes."); return; }
-      const r = await pool.query("SELECT id, pass FROM users WHERE email = $1", [email]);
+      const r = await pool.query("SELECT id, pass, role, active, token_ver FROM users WHERE email = $1", [email]);
       const ok = r.rows.length === 1 && typeof b.password === "string" && checkPassword(b.password, r.rows[0].pass);
       if(!ok){ addFail(key); await audit("login", email, ip, false); fail(req, res, 401, "identifiants_invalides", "E-mail ou mot de passe incorrect."); return; }
+      if(!r.rows[0].active){ await audit("login-desactive", email, ip, false); fail(req, res, 403, "compte_desactive", "Ce compte est désactivé : contacte l'administrateur."); return; }
       fails.delete(key);
+      await pool.query("UPDATE users SET last_login = $1 WHERE id = $2", [new Date().toISOString(), r.rows[0].id]);
       await audit("login", email, ip, true);
-      send(req, res, 200, { token: newToken(r.rows[0].id), email: email }); return;
+      send(req, res, 200, { token: newToken(r.rows[0]), email: email, role: r.rows[0].role }); return;
+    }
+    if((path === "/api/join" || path === "/api/reset") && req.method === "POST"){
+      const b = await readBody(req), email = String(b.email || "").trim().toLowerCase(), kind = path === "/api/join" ? "join" : "reset", key = "code|" + ip;
+      if(checkLock(key)){ fail(req, res, 429, "trop_d_essais", "Trop d'essais : réessaie dans 15 minutes."); return; }
+      if(typeof b.password !== "string" || b.password.length < 12){ fail(req, res, 400, "mot_de_passe_faible", "Le mot de passe doit contenir au moins 12 caractères."); return; }
+      const inv = await takeInvite(b.code, email, kind);
+      if(!inv){ addFail(key); await audit(kind, email, ip, false); fail(req, res, 403, "code_invalide", "Code invalide, expiré ou déjà utilisé (vérifie aussi l'adresse e-mail)."); return; }
+      let user;
+      if(kind === "join"){
+        if(!EMAIL_RE.test(email)){ fail(req, res, 400, "email_invalide", "Adresse e-mail invalide."); return; }
+        const ex = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+        if(ex.rows.length){ fail(req, res, 409, "deja_existant", "Un compte existe déjà avec cet e-mail : connecte-toi."); return; }
+        const r = await pool.query("INSERT INTO users (email, pass, created_at, role, active, token_ver, last_login) VALUES ($1, $2, $3, 'praticien', true, 0, $3) RETURNING id", [email, hashPassword(b.password), new Date().toISOString()]);
+        user = { id: r.rows[0].id, token_ver: 0, role: "praticien" };
+      } else {
+        const ur = await pool.query("SELECT id, role, token_ver FROM users WHERE id = $1", [inv.user_id]);
+        if(!ur.rows.length){ fail(req, res, 403, "code_invalide", "Code invalide, expiré ou déjà utilisé."); return; }
+        const ver = Number(ur.rows[0].token_ver) + 1;
+        await pool.query("UPDATE users SET pass = $1, token_ver = $2, last_login = $3 WHERE id = $4", [hashPassword(b.password), ver, new Date().toISOString(), inv.user_id]);
+        user = { id: inv.user_id, token_ver: ver, role: ur.rows[0].role };
+      }
+      await pool.query("UPDATE invites SET used = true WHERE id = $1", [inv.id]);
+      fails.delete(key);
+      await audit(kind, email, ip, true);
+      send(req, res, 200, { token: newToken(user), email: email, role: user.role }); return;
+    }
+    if(path === "/api/admin-recover" && req.method === "POST"){
+      const b = await readBody(req), key = "recover|" + ip, email = String(b.email || "").trim().toLowerCase();
+      if(checkLock(key)){ fail(req, res, 429, "trop_d_essais", "Trop d'essais : réessaie dans 15 minutes."); return; }
+      const r = await pool.query("SELECT id, token_ver FROM users WHERE email = $1 AND role = 'admin'", [email]);
+      if(!cfg.setupCode || !safeEq(b.setupCode || "", cfg.setupCode) || !r.rows.length){ addFail(key); await audit("recover", email, ip, false); fail(req, res, 403, "code_invalide", "Code incorrect ou compte administrateur introuvable."); return; }
+      if(typeof b.password !== "string" || b.password.length < 12){ fail(req, res, 400, "mot_de_passe_faible", "Le mot de passe doit contenir au moins 12 caractères."); return; }
+      const ver = Number(r.rows[0].token_ver) + 1;
+      await pool.query("UPDATE users SET pass = $1, token_ver = $2, active = true WHERE id = $3", [hashPassword(b.password), ver, r.rows[0].id]);
+      await audit("recover", email, ip, true);
+      send(req, res, 200, { token: newToken({ id: r.rows[0].id, token_ver: ver }), email: email, role: "admin" }); return;
     }
 
     // ----- à partir d'ici : connexion obligatoire -----
-    const uid = auth(req);
-    if(!uid){ fail(req, res, 401, "non_connecte", "Connexion requise."); return; }
+    const me = await authUser(req), uid = me && me.id;
+    if(!me){ fail(req, res, 401, "non_connecte", "Connexion requise."); return; }
 
+    if(path === "/api/me" && req.method === "GET"){ send(req, res, 200, { email: me.email, role: me.role }); return; }
     if(path === "/api/password" && req.method === "POST"){
       const b = await readBody(req);
-      const r = await pool.query("SELECT pass, email FROM users WHERE id = $1", [uid]);
-      if(!r.rows.length || typeof b.oldPassword !== "string" || !checkPassword(b.oldPassword, r.rows[0].pass)){ await audit("password", r.rows[0] && r.rows[0].email, ip, false); fail(req, res, 401, "identifiants_invalides", "Mot de passe actuel incorrect."); return; }
+      const r = await pool.query("SELECT pass, token_ver FROM users WHERE id = $1", [uid]);
+      if(typeof b.oldPassword !== "string" || !checkPassword(b.oldPassword, r.rows[0].pass)){ await audit("password", me.email, ip, false); fail(req, res, 401, "identifiants_invalides", "Mot de passe actuel incorrect."); return; }
       if(typeof b.newPassword !== "string" || b.newPassword.length < 12){ fail(req, res, 400, "mot_de_passe_faible", "Le nouveau mot de passe doit contenir au moins 12 caractères."); return; }
-      await pool.query("UPDATE users SET pass = $1 WHERE id = $2", [hashPassword(b.newPassword), uid]);
-      await audit("password", r.rows[0].email, ip, true);
-      send(req, res, 200, { ok: true }); return;
+      const ver = Number(r.rows[0].token_ver) + 1;
+      await pool.query("UPDATE users SET pass = $1, token_ver = $2 WHERE id = $3", [hashPassword(b.newPassword), ver, uid]);
+      await audit("password", me.email, ip, true);
+      send(req, res, 200, { ok: true, token: newToken({ id: uid, token_ver: ver }) }); return;
+    }
+
+    // ----- administration des praticiens (réservée à l'administrateur) -----
+    if(path.startsWith("/api/admin/")){
+      if(me.role !== "admin"){ fail(req, res, 403, "reserve_admin", "Réservé à l'administrateur."); return; }
+      if(path === "/api/admin/users" && req.method === "GET"){
+        const us = await pool.query("SELECT id, email, role, active, created_at, last_login, last_seen FROM users ORDER BY id ASC");
+        const cnt = await pool.query("SELECT user_id, COUNT(*) AS n FROM docs WHERE c = 'patients' AND deleted = false GROUP BY user_id");
+        const byUser = {}; cnt.rows.forEach(function(x){ byUser[x.user_id] = Number(x.n); });
+        const iv = await pool.query("SELECT id, email, kind, expires_at FROM invites WHERE used = false ORDER BY id ASC");
+        const nowIso = new Date().toISOString();
+        send(req, res, 200, {
+          maxUsers: cfg.maxUsers,
+          users: us.rows.map(function(u){ return { id: u.id, email: u.email, role: u.role, active: !!u.active, createdAt: u.created_at, lastLogin: u.last_login || "", lastSeen: [u.last_login || "", u.last_seen || ""].sort().pop(), patients: byUser[u.id] || 0, self: u.id === uid }; }),
+          invites: iv.rows.filter(function(i){ return i.expires_at > nowIso; }).map(function(i){ return { id: i.id, email: i.email, kind: i.kind, expiresAt: i.expires_at }; })
+        }); return;
+      }
+      if(path === "/api/admin/invite" && req.method === "POST"){
+        const b = await readBody(req), email = String(b.email || "").trim().toLowerCase();
+        if(!EMAIL_RE.test(email)){ fail(req, res, 400, "email_invalide", "Adresse e-mail invalide."); return; }
+        const ex = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+        if(ex.rows.length){ fail(req, res, 409, "deja_existant", "Un compte existe déjà avec cet e-mail."); return; }
+        const total = Number((await pool.query("SELECT COUNT(*) AS n FROM users")).rows[0].n) + Number((await pool.query("SELECT COUNT(*) AS n FROM invites WHERE used = false AND kind = 'join' AND email <> $1 AND expires_at > $2", [email, new Date().toISOString()])).rows[0].n);
+        if(total >= cfg.maxUsers){ fail(req, res, 409, "limite_atteinte", "Nombre maximum de praticiens atteint (" + cfg.maxUsers + ")."); return; }
+        const inv = await createInvite(email, "join", null, uid);
+        await audit("admin:invite", email, ip, true);
+        send(req, res, 200, inv); return;
+      }
+      let m = /^\/api\/admin\/invites\/(\d+)\/revoke$/.exec(path);
+      if(m && req.method === "POST"){
+        await pool.query("DELETE FROM invites WHERE id = $1 AND used = false", [Number(m[1])]);
+        await audit("admin:revoke", "", ip, true);
+        send(req, res, 200, { ok: true }); return;
+      }
+      m = /^\/api\/admin\/users\/(\d+)\/(active|reset|delete)$/.exec(path);
+      if(m && req.method === "POST"){
+        const tid = Number(m[1]), act = m[2], b = await readBody(req);
+        const tr = await pool.query("SELECT id, email, role, token_ver FROM users WHERE id = $1", [tid]);
+        if(!tr.rows.length){ fail(req, res, 404, "introuvable", "Praticien introuvable."); return; }
+        const t = tr.rows[0];
+        if(act !== "reset" && tid === uid){ fail(req, res, 400, "action_impossible", "Tu ne peux pas faire cela sur ton propre compte."); return; }
+        if(act === "active"){
+          const on = !!b.active;
+          await pool.query("UPDATE users SET active = $1, token_ver = $2 WHERE id = $3", [on, Number(t.token_ver) + (on ? 0 : 1), tid]);
+          await audit(on ? "admin:reactiver" : "admin:desactiver", t.email, ip, true);
+          send(req, res, 200, { ok: true }); return;
+        }
+        if(act === "reset"){
+          const inv = await createInvite(t.email, "reset", tid, uid);
+          await audit("admin:reset", t.email, ip, true);
+          send(req, res, 200, inv); return;
+        }
+        if(String(b.confirmEmail || "").trim().toLowerCase() !== t.email){ fail(req, res, 400, "confirmation", "Pour supprimer, retape l'adresse e-mail du praticien."); return; }
+        await pool.query("DELETE FROM docs WHERE user_id = $1", [tid]);
+        await pool.query("DELETE FROM invites WHERE user_id = $1 OR email = $2", [tid, t.email]);
+        await pool.query("DELETE FROM users WHERE id = $1", [tid]);
+        await audit("admin:supprimer", t.email, ip, true);
+        send(req, res, 200, { ok: true }); return;
+      }
+      fail(req, res, 404, "introuvable", "Adresse inconnue."); return;
     }
 
     if(path === "/api/sync" && req.method === "GET"){
@@ -222,6 +351,7 @@ function createApp(pool, cfg){
 
 function configFromEnv(env){
   return {
+    maxUsers: Math.max(1, parseInt(env.MAX_USERS) || 20),
     port: parseInt(env.PORT) || 8080,
     dbUrl: env.DATABASE_URL || env.POSTGRESQL_ADDON_URI || "",
     secret: env.JWT_SECRET || "",
