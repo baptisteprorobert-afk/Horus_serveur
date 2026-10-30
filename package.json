@@ -1,0 +1,17 @@
+{
+  "name": "horus-server",
+  "version": "1.0.0",
+  "description": "Serveur de synchronisation de l'application Horus (un seul praticien).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pg": "^8.11.0"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
