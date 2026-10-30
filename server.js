@@ -8,6 +8,7 @@
        SETUP_CODE      : code secret pour créer le compte administrateur la première fois
                          (il sert aussi à récupérer l'accès administrateur : garde-le secret)
        MAX_USERS       : nombre maximum de praticiens (20 par défaut)
+       PG_POOL_MAX     : connexions simultanées à la base (3 par défaut : adapté aux petits plans)
        ALLOWED_ORIGIN  : adresse de l'application, ex. https://mon-site.netlify.app
                          (plusieurs adresses possibles, séparées par des virgules)
        PORT            : fourni par l'hébergeur
@@ -62,6 +63,12 @@ function safeEq(a, b){
 
 async function initDb(pool){
   await pool.query("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, pass TEXT NOT NULL, created_at TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'praticien', active BOOLEAN NOT NULL DEFAULT true, token_ver INTEGER NOT NULL DEFAULT 0, last_login TEXT, last_seen TEXT)");
+  // Mise à niveau depuis la première version du serveur (comptes sans rôle) : on ajoute les colonnes manquantes.
+  const cols = [["role", "TEXT NOT NULL DEFAULT 'praticien'"], ["active", "BOOLEAN NOT NULL DEFAULT true"], ["token_ver", "INTEGER NOT NULL DEFAULT 0"], ["last_login", "TEXT"], ["last_seen", "TEXT"]];
+  for(const c of cols){ try{ await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS " + c[0] + " " + c[1]); }catch(e){ /* déjà présente */ } }
+  const adm = await pool.query("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'");
+  const tot = await pool.query("SELECT MIN(id) AS m, COUNT(*) AS n FROM users");
+  if(Number(adm.rows[0].n) === 0 && Number(tot.rows[0].n) > 0){ await pool.query("UPDATE users SET role = 'admin' WHERE id = $1", [tot.rows[0].m]); console.log("Mise à niveau : le premier compte devient administrateur."); }
   await pool.query("CREATE TABLE IF NOT EXISTS invites (id SERIAL PRIMARY KEY, code_hash TEXT UNIQUE NOT NULL, email TEXT NOT NULL, kind TEXT NOT NULL, user_id INTEGER, expires_at TEXT NOT NULL, used BOOLEAN NOT NULL DEFAULT false, created_by INTEGER, created_at TEXT NOT NULL)");
   await pool.query("CREATE TABLE IF NOT EXISTS docs (user_id INTEGER NOT NULL, c TEXT NOT NULL, id TEXT NOT NULL, data JSONB, updated_at TEXT NOT NULL, deleted BOOLEAN NOT NULL DEFAULT false, rev BIGINT NOT NULL, PRIMARY KEY (user_id, c, id))");
   await pool.query("CREATE INDEX IF NOT EXISTS docs_rev_idx ON docs (user_id, rev)");
@@ -160,7 +167,7 @@ function createApp(pool, cfg){
       } else res.writeHead(403);
       res.end(); return;
     }
-    if(path === "/health" && req.method === "GET"){ send(req, res, 200, { ok: true }); return; }
+    if(path === "/health" && req.method === "GET"){ send(req, res, 200, { ok: true, version: 2 }); return; }
     if(origin && !originAllowed(origin)){ fail(req, res, 403, "origine_refusee", "Origine non autorisée."); return; }
 
     if(path === "/api/status" && req.method === "GET"){
@@ -357,7 +364,8 @@ function configFromEnv(env){
     secret: env.JWT_SECRET || "",
     setupCode: env.SETUP_CODE || "",
     origins: String(env.ALLOWED_ORIGIN || "").split(",").map(function(s){ return s.trim().replace(/\/$/, ""); }).filter(Boolean),
-    ssl: env.PGSSL === "1"
+    ssl: env.PGSSL === "1",
+    poolMax: Math.max(1, Math.min(20, parseInt(env.PG_POOL_MAX) || 3))
   };
 }
 
@@ -369,7 +377,7 @@ if(require.main === module){
   if(cfg.secret.length < 32){ console.error("JWT_SECRET manquant ou trop court (32 caractères minimum)."); process.exit(1); }
   if(!cfg.origins.length) console.warn("ALLOWED_ORIGIN vide : aucune application ne pourra se connecter.");
   const { Pool } = require("pg");
-  const pool = new Pool({ connectionString: cfg.dbUrl, ssl: cfg.ssl ? { rejectUnauthorized: false } : undefined, max: 5 });
+  const pool = new Pool({ connectionString: cfg.dbUrl, ssl: cfg.ssl ? { rejectUnauthorized: false } : undefined, max: cfg.poolMax });
   initDb(pool).then(function(){
     const server = createApp(pool, cfg);
     server.listen(cfg.port, function(){ console.log("Serveur Horus prêt sur le port " + cfg.port); });
