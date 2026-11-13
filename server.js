@@ -17,7 +17,10 @@
 const http = require("http");
 const crypto = require("crypto");
 
-const COLLECTIONS = new Set(["patients", "agenda", "plages", "closures", "exerciseCatalog", "meta"]);
+const COLLECTIONS = new Set(["patients", "agenda", "plages", "closures", "exerciseCatalog", "meta", "athEntries"]);
+const ATH_PATIENT_KEYS = ["id", "name", "createdAt", "updatedAt", "dob", "sex", "weightKg", "heightCm", "measurements", "leverArms", "program", "tests"];
+const MAX_ATH_DOC = 512 * 1024, MAX_ATHLETES = 20;
+function redactPatient(d){ const o = {}; if(d && typeof d === "object") ATH_PATIENT_KEYS.forEach(function(k){ if(d[k] !== undefined) o[k] = d[k]; }); return o; }
 const ID_RE = /^[\w-]{1,80}$/;
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/;
 const MAX_BODY = 12 * 1024 * 1024, MAX_DOC = 4 * 1024 * 1024, MAX_BATCH = 100;
@@ -66,10 +69,13 @@ async function initDb(pool){
   // Mise à niveau depuis la première version du serveur (comptes sans rôle) : on ajoute les colonnes manquantes.
   const cols = [["role", "TEXT NOT NULL DEFAULT 'praticien'"], ["active", "BOOLEAN NOT NULL DEFAULT true"], ["token_ver", "INTEGER NOT NULL DEFAULT 0"], ["last_login", "TEXT"], ["last_seen", "TEXT"]];
   for(const c of cols){ try{ await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS " + c[0] + " " + c[1]); }catch(e){ /* déjà présente */ } }
+  // Accès athlète (ajout) : un compte athlète est rattaché à un praticien (owner_id) et à une seule fiche patient (patient_id).
+  for(const c of [["owner_id", "INTEGER"], ["patient_id", "TEXT"]]){ try{ await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS " + c[0] + " " + c[1]); }catch(e){ /* déjà présente */ } }
   const adm = await pool.query("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'");
   const tot = await pool.query("SELECT MIN(id) AS m, COUNT(*) AS n FROM users");
   if(Number(adm.rows[0].n) === 0 && Number(tot.rows[0].n) > 0){ await pool.query("UPDATE users SET role = 'admin' WHERE id = $1", [tot.rows[0].m]); console.log("Mise à niveau : le premier compte devient administrateur."); }
   await pool.query("CREATE TABLE IF NOT EXISTS invites (id SERIAL PRIMARY KEY, code_hash TEXT UNIQUE NOT NULL, email TEXT NOT NULL, kind TEXT NOT NULL, user_id INTEGER, expires_at TEXT NOT NULL, used BOOLEAN NOT NULL DEFAULT false, created_by INTEGER, created_at TEXT NOT NULL)");
+  try{ await pool.query("ALTER TABLE invites ADD COLUMN IF NOT EXISTS payload TEXT"); }catch(e){ /* déjà présente */ }
   await pool.query("CREATE TABLE IF NOT EXISTS docs (user_id INTEGER NOT NULL, c TEXT NOT NULL, id TEXT NOT NULL, data JSONB, updated_at TEXT NOT NULL, deleted BOOLEAN NOT NULL DEFAULT false, rev BIGINT NOT NULL, PRIMARY KEY (user_id, c, id))");
   await pool.query("CREATE INDEX IF NOT EXISTS docs_rev_idx ON docs (user_id, rev)");
   await pool.query("CREATE TABLE IF NOT EXISTS rev_counter (id INTEGER PRIMARY KEY, v BIGINT NOT NULL)");
@@ -117,23 +123,23 @@ function createApp(pool, cfg){
     const h = String(req.headers.authorization || "");
     const p = h.startsWith("Bearer ") ? verify(h.slice(7), cfg.secret) : null;
     if(!p) return null;
-    const r = await pool.query("SELECT id, email, role, active, token_ver, last_seen FROM users WHERE id = $1", [p.u]);
+    const r = await pool.query("SELECT id, email, role, active, token_ver, last_seen, owner_id, patient_id FROM users WHERE id = $1", [p.u]);
     const u = r.rows[0];
     if(!u || !u.active || Number(u.token_ver) !== Number(p.v)) return null;
     const nowIso = new Date().toISOString();
     if(!u.last_seen || Date.parse(nowIso) - Date.parse(u.last_seen) > 10 * 60 * 1000) await pool.query("UPDATE users SET last_seen = $1 WHERE id = $2", [nowIso, u.id]);
-    return { id: u.id, email: u.email, role: u.role };
+    return { id: u.id, email: u.email, role: u.role, owner: u.owner_id, patient: u.patient_id };
   }
   function newToken(u){ return sign({ u: u.id, v: Number(u.token_ver || 0), exp: Date.now() + TOKEN_MS }, cfg.secret); }
   function codeHash(code){ return crypto.createHmac("sha256", cfg.secret).update(normCode(code)).digest("hex"); }
-  async function createInvite(email, kind, userId, createdBy){
+  async function createInvite(email, kind, userId, createdBy, payload){
     const code = newCode(), exp = new Date(Date.now() + INVITE_MS).toISOString();
     await pool.query("DELETE FROM invites WHERE used = false AND email = $1 AND kind = $2", [email, kind]);
-    await pool.query("INSERT INTO invites (code_hash, email, kind, user_id, expires_at, used, created_by, created_at) VALUES ($1, $2, $3, $4, $5, false, $6, $7)", [codeHash(code), email, kind, userId || null, exp, createdBy || null, new Date().toISOString()]);
+    await pool.query("INSERT INTO invites (code_hash, email, kind, user_id, expires_at, used, created_by, created_at, payload) VALUES ($1, $2, $3, $4, $5, false, $6, $7, $8)", [codeHash(code), email, kind, userId || null, exp, createdBy || null, new Date().toISOString(), payload || null]);
     return { code: code, expiresAt: exp };
   }
   async function takeInvite(code, email, kind){
-    const r = await pool.query("SELECT id, email, user_id, expires_at, used FROM invites WHERE code_hash = $1 AND kind = $2", [codeHash(code), kind]);
+    const r = await pool.query("SELECT id, email, user_id, expires_at, used, payload FROM invites WHERE code_hash = $1 AND kind = $2", [codeHash(code), kind]);
     const inv = r.rows[0];
     if(!inv || inv.used || inv.expires_at < new Date().toISOString() || inv.email !== email) return null;
     return inv;
@@ -224,6 +230,21 @@ function createApp(pool, cfg){
       await audit(kind, email, ip, true);
       send(req, res, 200, { token: newToken(user), email: email, role: user.role }); return;
     }
+    if(path === "/api/athlete/join" && req.method === "POST"){
+      const b = await readBody(req), email = String(b.email || "").trim().toLowerCase(), key = "code|" + ip;
+      if(checkLock(key)){ fail(req, res, 429, "trop_d_essais", "Trop d'essais : réessaie dans 15 minutes."); return; }
+      if(typeof b.password !== "string" || b.password.length < 12){ fail(req, res, 400, "mot_de_passe_faible", "Le mot de passe doit contenir au moins 12 caractères."); return; }
+      const inv = await takeInvite(b.code, email, "athlete");
+      if(!inv || !inv.user_id || !inv.payload){ addFail(key); await audit("athlete-join", email, ip, false); fail(req, res, 403, "code_invalide", "Code invalide, expiré ou déjà utilisé (vérifie aussi l'adresse e-mail)."); return; }
+      if(!EMAIL_RE.test(email)){ fail(req, res, 400, "email_invalide", "Adresse e-mail invalide."); return; }
+      const ex = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+      if(ex.rows.length){ fail(req, res, 409, "deja_existant", "Un compte existe déjà avec cet e-mail : connecte-toi."); return; }
+      const r = await pool.query("INSERT INTO users (email, pass, created_at, role, active, token_ver, last_login, owner_id, patient_id) VALUES ($1, $2, $3, 'athlete', true, 0, $3, $4, $5) RETURNING id", [email, hashPassword(b.password), new Date().toISOString(), inv.user_id, inv.payload]);
+      await pool.query("UPDATE invites SET used = true WHERE id = $1", [inv.id]);
+      fails.delete(key);
+      await audit("athlete-join", email, ip, true);
+      send(req, res, 200, { token: newToken({ id: r.rows[0].id, token_ver: 0 }), email: email, role: "athlete", patient: inv.payload }); return;
+    }
     if(path === "/api/admin-recover" && req.method === "POST"){
       const b = await readBody(req), key = "recover|" + ip, email = String(b.email || "").trim().toLowerCase();
       if(checkLock(key)){ fail(req, res, 429, "trop_d_essais", "Trop d'essais : réessaie dans 15 minutes."); return; }
@@ -240,7 +261,8 @@ function createApp(pool, cfg){
     const me = await authUser(req), uid = me && me.id;
     if(!me){ fail(req, res, 401, "non_connecte", "Connexion requise."); return; }
 
-    if(path === "/api/me" && req.method === "GET"){ send(req, res, 200, { email: me.email, role: me.role }); return; }
+    const isAth = me.role === "athlete";
+    if(path === "/api/me" && req.method === "GET"){ send(req, res, 200, isAth ? { email: me.email, role: me.role, patient: me.patient } : { email: me.email, role: me.role }); return; }
     if(path === "/api/password" && req.method === "POST"){
       const b = await readBody(req);
       const r = await pool.query("SELECT pass, token_ver FROM users WHERE id = $1", [uid]);
@@ -250,6 +272,50 @@ function createApp(pool, cfg){
       await pool.query("UPDATE users SET pass = $1, token_ver = $2 WHERE id = $3", [hashPassword(b.newPassword), ver, uid]);
       await audit("password", me.email, ip, true);
       send(req, res, 200, { ok: true, token: newToken({ id: uid, token_ver: ver }) }); return;
+    }
+
+    // ----- accès athlète : gestion par le praticien (jamais par un athlète) -----
+    if(path.startsWith("/api/athlete/")){
+      if(isAth){ fail(req, res, 403, "reserve_praticien", "Réservé au praticien."); return; }
+      if(path === "/api/athlete/invite" && req.method === "POST"){
+        const b = await readBody(req), email = String(b.email || "").trim().toLowerCase(), pid = String(b.patientId || "");
+        if(!EMAIL_RE.test(email)){ fail(req, res, 400, "email_invalide", "Adresse e-mail invalide."); return; }
+        if(!ID_RE.test(pid)){ fail(req, res, 400, "patient_invalide", "Fiche patient invalide."); return; }
+        const pd = await pool.query("SELECT 1 FROM docs WHERE user_id = $1 AND c = 'patients' AND id = $2 AND deleted = false", [uid, pid]);
+        if(!pd.rows.length){ fail(req, res, 404, "patient_introuvable", "Cette fiche n'est pas encore sur le serveur : synchronise d'abord ton app, puis réessaie."); return; }
+        const ex = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+        if(ex.rows.length){ fail(req, res, 409, "deja_existant", "Un compte existe déjà avec cet e-mail."); return; }
+        const cnt = Number((await pool.query("SELECT COUNT(*) AS n FROM users WHERE owner_id = $1", [uid])).rows[0].n) + Number((await pool.query("SELECT COUNT(*) AS n FROM invites WHERE kind = 'athlete' AND used = false AND created_by = $1 AND expires_at > $2", [uid, new Date().toISOString()])).rows[0].n);
+        if(cnt >= MAX_ATHLETES){ fail(req, res, 409, "limite_atteinte", "Nombre maximum d'athlètes atteint (" + MAX_ATHLETES + ")."); return; }
+        const inv = await createInvite(email, "athlete", uid, uid, pid);
+        await audit("athlete:invite", email, ip, true);
+        send(req, res, 200, inv); return;
+      }
+      if(path === "/api/athlete/list" && req.method === "GET"){
+        const us = await pool.query("SELECT id, email, patient_id, active, created_at, last_login, last_seen FROM users WHERE owner_id = $1 ORDER BY id ASC", [uid]);
+        const iv = await pool.query("SELECT id, email, payload, expires_at FROM invites WHERE kind = 'athlete' AND used = false AND created_by = $1 AND expires_at > $2 ORDER BY id ASC", [uid, new Date().toISOString()]);
+        send(req, res, 200, { athletes: us.rows.map(function(u){ return { id: u.id, email: u.email, patientId: u.patient_id, active: !!u.active, createdAt: u.created_at, lastLogin: u.last_login, lastSeen: u.last_seen }; }), invites: iv.rows.map(function(i){ return { id: i.id, email: i.email, patientId: i.payload, expiresAt: i.expires_at }; }) }); return;
+      }
+      let ma = /^\/api\/athlete\/(\d+)\/(active|delete)$/.exec(path);
+      if(ma && req.method === "POST"){
+        const aid = parseInt(ma[1]), b = await readBody(req);
+        const ar = await pool.query("SELECT id, email FROM users WHERE id = $1 AND owner_id = $2", [aid, uid]);
+        if(!ar.rows.length){ fail(req, res, 404, "introuvable", "Athlète introuvable."); return; }
+        if(ma[2] === "active"){
+          await pool.query("UPDATE users SET active = $1, token_ver = token_ver + 1 WHERE id = $2", [!!b.active, aid]);
+          await audit("athlete:" + (b.active ? "reactive" : "coupe"), ar.rows[0].email, ip, true);
+        } else {
+          await pool.query("DELETE FROM users WHERE id = $1", [aid]);
+          await audit("athlete:supprime", ar.rows[0].email, ip, true);
+        }
+        send(req, res, 200, { ok: true }); return;
+      }
+      let mi = /^\/api\/athlete\/invites\/(\d+)\/revoke$/.exec(path);
+      if(mi && req.method === "POST"){
+        await pool.query("DELETE FROM invites WHERE id = $1 AND created_by = $2 AND kind = 'athlete' AND used = false", [parseInt(mi[1]), uid]);
+        send(req, res, 200, { ok: true }); return;
+      }
+      fail(req, res, 404, "introuvable", "Adresse inconnue."); return;
     }
 
     // ----- administration des praticiens (réservée à l'administrateur) -----
@@ -311,6 +377,50 @@ function createApp(pool, cfg){
       }
       fail(req, res, 404, "introuvable", "Adresse inconnue."); return;
     }
+
+    if(isAth && path === "/api/sync"){
+      const owner = me.owner, pid = me.patient;
+      if(!owner || !pid){ fail(req, res, 403, "compte_invalide", "Compte athlète incomplet."); return; }
+      if(req.method === "GET"){
+        const since = Math.max(0, parseInt(url.searchParams.get("since")) || 0), limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get("limit")) || 100));
+        let cursor = since, out = [], more = false;
+        for(let guard = 0; guard < 40; guard++){
+          const r = await pool.query("SELECT c, id, data, updated_at, deleted, rev FROM docs WHERE user_id = $1 AND rev > $2 AND c IN ('patients', 'athEntries', 'agenda', 'exerciseCatalog') ORDER BY rev ASC LIMIT 500", [owner, cursor]);
+          for(const d of r.rows){
+            cursor = Number(d.rev);
+            const okDoc = (d.c === "patients" && d.id === pid) || (d.c === "athEntries" && d.id.indexOf(pid + "-") === 0) || (d.c === "agenda" && !d.deleted && d.data && d.data.patientId === pid) || d.c === "exerciseCatalog";
+            if(!okDoc) continue;
+            if(out.length >= limit){ more = true; break; }
+            out.push({ c: d.c, id: d.id, data: d.deleted ? null : (d.c === "patients" ? redactPatient(d.data) : d.data), updatedAt: d.updated_at, deleted: !!d.deleted, rev: Number(d.rev) });
+          }
+          if(more || r.rows.length < 500) break;
+        }
+        send(req, res, 200, { rev: await currentRev(), more: more, docs: out }); return;
+      }
+      if(req.method === "POST"){
+        const b = await readBody(req);
+        if(!Array.isArray(b.docs) || b.docs.length > MAX_BATCH){ fail(req, res, 400, "lot_invalide", "Lot de documents invalide (100 maximum)."); return; }
+        for(const d of b.docs){
+          if(!d || d.c !== "athEntries" || typeof d.id !== "string" || !ID_RE.test(d.id) || d.id.indexOf(pid + "-") !== 0 || typeof d.updatedAt !== "string" || d.updatedAt.length > 40){ fail(req, res, 403, "hors_perimetre", "Cet envoi sort du périmètre de ton accès."); return; }
+          if(!d.deleted && (typeof d.data !== "object" || d.data === null || d.data.patientId !== pid || JSON.stringify(d.data).length > MAX_ATH_DOC)){ fail(req, res, 400, "document_invalide", "Document invalide ou trop volumineux."); return; }
+        }
+        const result = await (writeChain = writeChain.then(async function(){
+          const accepted = [], rejected = [];
+          for(const d of b.docs){
+            const ex = await pool.query("SELECT updated_at FROM docs WHERE user_id = $1 AND c = $2 AND id = $3", [owner, d.c, d.id]);
+            if(ex.rows.length && !(d.updatedAt > ex.rows[0].updated_at)){ rejected.push({ c: d.c, id: d.id, reason: "plus_ancien" }); continue; }
+            const rev = await nextRev(), data = d.deleted ? null : JSON.stringify(d.data);
+            if(ex.rows.length) await pool.query("UPDATE docs SET data = $1, updated_at = $2, deleted = $3, rev = $4 WHERE user_id = $5 AND c = $6 AND id = $7", [data, d.updatedAt, !!d.deleted, rev, owner, d.c, d.id]);
+            else await pool.query("INSERT INTO docs (user_id, c, id, data, updated_at, deleted, rev) VALUES ($1, $2, $3, $4, $5, $6, $7)", [owner, d.c, d.id, data, d.updatedAt, !!d.deleted, rev]);
+            accepted.push({ c: d.c, id: d.id });
+          }
+          return { accepted: accepted, rejected: rejected, rev: await currentRev() };
+        }).catch(function(e){ writeChain = Promise.resolve(); throw e; }));
+        send(req, res, 200, result); return;
+      }
+    }
+    if(isAth && (path === "/api/export")){ fail(req, res, 403, "reserve_praticien", "Réservé au praticien."); return; }
+    if(isAth){ if(path !== "/api/password"){ fail(req, res, 403, "hors_perimetre", "Cet accès est réservé à ta fiche."); return; } }
 
     if(path === "/api/sync" && req.method === "GET"){
       const since = Math.max(0, parseInt(url.searchParams.get("since")) || 0), limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get("limit")) || 100));
