@@ -24,7 +24,7 @@ function redactPatient(d){ const o = {}; if(d && typeof d === "object") ATH_PATI
 const ID_RE = /^[\w-]{1,80}$/;
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/;
 const MAX_BODY = 12 * 1024 * 1024, MAX_DOC = 4 * 1024 * 1024, MAX_BATCH = 100;
-const TOKEN_MS = 30 * 24 * 3600 * 1000, INVITE_MS = 7 * 24 * 3600 * 1000;
+const TOKEN_MS = 30 * 24 * 3600 * 1000, INVITE_MS = 7 * 24 * 3600 * 1000, ATH_TOKEN_MS = 365 * 24 * 3600 * 1000;
 const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";   // sans I, L, O, 0, 1 (confusions)
 
 function b64u(s){ return Buffer.from(s).toString("base64url"); }
@@ -130,7 +130,7 @@ function createApp(pool, cfg){
     if(!u.last_seen || Date.parse(nowIso) - Date.parse(u.last_seen) > 10 * 60 * 1000) await pool.query("UPDATE users SET last_seen = $1 WHERE id = $2", [nowIso, u.id]);
     return { id: u.id, email: u.email, role: u.role, owner: u.owner_id, patient: u.patient_id };
   }
-  function newToken(u){ return sign({ u: u.id, v: Number(u.token_ver || 0), exp: Date.now() + TOKEN_MS }, cfg.secret); }
+  function newToken(u, ms){ return sign({ u: u.id, v: Number(u.token_ver || 0), exp: Date.now() + (ms || TOKEN_MS) }, cfg.secret); }
   function codeHash(code){ return crypto.createHmac("sha256", cfg.secret).update(normCode(code)).digest("hex"); }
   async function createInvite(email, kind, userId, createdBy, payload){
     const code = newCode(), exp = new Date(Date.now() + INVITE_MS).toISOString();
@@ -203,7 +203,7 @@ function createApp(pool, cfg){
       fails.delete(key);
       await pool.query("UPDATE users SET last_login = $1 WHERE id = $2", [new Date().toISOString(), r.rows[0].id]);
       await audit("login", email, ip, true);
-      send(req, res, 200, { token: newToken(r.rows[0]), email: email, role: r.rows[0].role }); return;
+      send(req, res, 200, { token: newToken(r.rows[0], r.rows[0].role === "athlete" ? ATH_TOKEN_MS : undefined), email: email, role: r.rows[0].role }); return;
     }
     if((path === "/api/join" || path === "/api/reset") && req.method === "POST"){
       const b = await readBody(req), email = String(b.email || "").trim().toLowerCase(), kind = path === "/api/join" ? "join" : "reset", key = "code|" + ip;
@@ -243,7 +243,7 @@ function createApp(pool, cfg){
       await pool.query("UPDATE invites SET used = true WHERE id = $1", [inv.id]);
       fails.delete(key);
       await audit("athlete-join", email, ip, true);
-      send(req, res, 200, { token: newToken({ id: r.rows[0].id, token_ver: 0 }), email: email, role: "athlete", patient: inv.payload }); return;
+      send(req, res, 200, { token: newToken({ id: r.rows[0].id, token_ver: 0 }, ATH_TOKEN_MS), email: email, role: "athlete", patient: inv.payload }); return;
     }
     if(path === "/api/admin-recover" && req.method === "POST"){
       const b = await readBody(req), key = "recover|" + ip, email = String(b.email || "").trim().toLowerCase();
@@ -271,9 +271,15 @@ function createApp(pool, cfg){
       const ver = Number(r.rows[0].token_ver) + 1;
       await pool.query("UPDATE users SET pass = $1, token_ver = $2 WHERE id = $3", [hashPassword(b.newPassword), ver, uid]);
       await audit("password", me.email, ip, true);
-      send(req, res, 200, { ok: true, token: newToken({ id: uid, token_ver: ver }) }); return;
+      send(req, res, 200, { ok: true, token: newToken({ id: uid, token_ver: ver }, me.role === "athlete" ? ATH_TOKEN_MS : undefined) }); return;
     }
 
+    // ----- accès athlète : renouvellement silencieux (l'athlète ne se reconnecte jamais tant qu'il s'en sert) -----
+    if(path === "/api/athlete/refresh" && req.method === "POST"){
+      if(!isAth){ fail(req, res, 403, "reserve_athlete", "Réservé aux comptes athlète."); return; }
+      const ur = await pool.query("SELECT token_ver FROM users WHERE id = $1", [uid]);
+      send(req, res, 200, { token: newToken({ id: uid, token_ver: ur.rows[0].token_ver }, ATH_TOKEN_MS) }); return;
+    }
     // ----- accès athlète : gestion par le praticien (jamais par un athlète) -----
     if(path.startsWith("/api/athlete/")){
       if(isAth){ fail(req, res, 403, "reserve_praticien", "Réservé au praticien."); return; }
